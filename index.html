@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Speech Detection - Simplified</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin: 0;
+            padding: 20px;
+            box-sizing: border-box;
+        }
+        
+        .container {
+            background: white;
+            padding: 40px;
+            border-radius: 20px;
+            text-align: center;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            min-width: 450px;
+            max-width: 600px;
+        }
+        
+        h1 {
+            color: #333;
+            margin-bottom: 30px;
+        }
+        
+        .state {
+            font-size: 2.5em;
+            font-weight: bold;
+            margin: 20px 0;
+            padding: 20px;
+            border-radius: 15px;
+            min-height: 60px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            transition: all 0.3s ease;
+        }
+        
+        .state.quiet { 
+            background: #f5f5f5; 
+            color: #666; 
+            border: 2px solid #ddd;
+        }
+        
+        .state.starting { 
+            background: #fff3cd; 
+            color: #856404; 
+            border: 2px solid #ffeaa7;
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+        
+        .state.speaking { 
+            background: #d4edda; 
+            color: #155724; 
+            border: 2px solid #4CAF50;
+            box-shadow: 0 0 20px rgba(76, 175, 80, 0.3);
+        }
+        
+        .state.stopping { 
+            background: #f8d7da; 
+            color: #721c24; 
+            border: 2px solid #f5c6cb;
+            animation: fadeOut 1s ease-in-out infinite alternate;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { transform: scale(1); opacity: 0.8; }
+            50% { transform: scale(1.05); opacity: 1; }
+        }
+        
+        @keyframes fadeOut {
+            0% { opacity: 1; }
+            100% { opacity: 0.6; }
+        }
+        
+        .metrics {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            gap: 15px;
+            margin: 20px 0;
+            text-align: center;
+        }
+        
+        .metric {
+            background: #f8f9fa;
+            padding: 15px;
+            border-radius: 10px;
+            border-left: 4px solid #667eea;
+        }
+        
+        .metric-label {
+            font-size: 12px;
+            color: #666;
+            text-transform: uppercase;
+            margin-bottom: 5px;
+        }
+        
+        .metric-value {
+            font-size: 18px;
+            font-weight: bold;
+            color: #333;
+        }
+        
+        .controls {
+            display: flex;
+            gap: 15px;
+            justify-content: center;
+            margin: 30px 0;
+            flex-wrap: wrap;
+        }
+        
+        button {
+            padding: 15px 25px;
+            border: none;
+            border-radius: 25px;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.2s;
+            min-width: 120px;
+        }
+        
+        button:hover:not(:disabled) { 
+            transform: translateY(-2px); 
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+        }
+        
+        button:disabled { 
+            opacity: 0.5; 
+            cursor: not-allowed; 
+            transform: none; 
+        }
+        
+        .start { background: #4CAF50; color: white; }
+        .stop { background: #f44336; color: white; }
+        .reset { background: #ff9800; color: white; }
+        
+        .connection {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            padding: 8px 16px;
+            border-radius: 15px;
+            font-weight: bold;
+            font-size: 14px;
+            z-index: 1000;
+        }
+        
+        .connected { background: #4CAF50; color: white; }
+        .disconnected { background: #f44336; color: white; }
+        
+        .recording-indicator {
+            position: fixed;
+            top: 20px;
+            left: 20px;
+            padding: 8px 16px;
+            border-radius: 15px;
+            font-weight: bold;
+            font-size: 14px;
+            background: #f44336;
+            color: white;
+            z-index: 1000;
+            display: none;
+        }
+        
+        .recording-indicator.active {
+            display: block;
+            animation: recordingBlink 1s ease-in-out infinite alternate;
+        }
+        
+        @keyframes recordingBlink {
+            0% { opacity: 1; }
+            100% { opacity: 0.5; }
+        }
+    </style>
+</head>
+<body>
+    <div class="connection" id="connection">Disconnected</div>
+    <div class="recording-indicator" id="recordingIndicator">🔴 RECORDING</div>
+    
+    <div class="container">
+        <h1>🎤 Speech Detection</h1>
+        
+        <div class="state quiet" id="stateDisplay">🔇 QUIET</div>
+        
+        <div class="metrics">
+            <div class="metric">
+                <div class="metric-label">Current VAD</div>
+                <div class="metric-value" id="currentProb">0.000</div>
+            </div>
+            <div class="metric">
+                <div class="metric-label">Smoothed VAD</div>
+                <div class="metric-value" id="smoothedProb">0.000</div>
+            </div>
+            <div class="metric">
+                <div class="metric-label">Speech Segments</div>
+                <div class="metric-value" id="segmentCount">0</div>
+            </div>
+            <div class="metric">
+                <div class="metric-label">Current Duration</div>
+                <div class="metric-value" id="currentDuration">0.0s</div>
+            </div>
+        </div>
+        
+        <div class="controls">
+            <button class="start" id="startBtn">Start Recording</button>
+            <button class="reset" id="resetBtn">Reset</button>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        let audioContext = null;
+        let isListening = false;
+        let isRecording = false;
+        
+        const stateDisplay = document.getElementById('stateDisplay');
+        const startBtn = document.getElementById('startBtn');
+        const connection = document.getElementById('connection');
+        const recordingIndicator = document.getElementById('recordingIndicator');
+        const currentProb = document.getElementById('currentProb');
+        const smoothedProb = document.getElementById('smoothedProb');
+        const segmentCount = document.getElementById('segmentCount');
+        const currentDuration = document.getElementById('currentDuration');
+        
+        // Connect WebSocket
+        function connect() {
+            const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${location.host}/ws`);
+            
+            ws.onopen = () => {
+                connection.textContent = 'Connected';
+                connection.className = 'connection connected';
+            };
+            
+            ws.onclose = () => {
+                connection.textContent = 'Disconnected';
+                connection.className = 'connection disconnected';
+                setTimeout(connect, 3000);
+            };
+            
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                
+                if (data.events && data.state) {
+                    handleStateUpdate(data.state);
+                } else if (data.recording_started) {
+                    isRecording = true;
+                    recordingIndicator.className = 'recording-indicator active';
+                } else if (data.recording_stopped) {
+                    isRecording = false;
+                    recordingIndicator.className = 'recording-indicator';
+                }
+            };
+        }
+        
+        // Handle state updates
+        function handleStateUpdate(state) {
+            updateStateDisplay(state.state);
+            currentProb.textContent = (state.current_prob || 0).toFixed(3);
+            smoothedProb.textContent = state.smoothed_prob.toFixed(3);
+            segmentCount.textContent = state.segments_count;
+            currentDuration.textContent = state.current_segment_duration.toFixed(1) + 's';
+        }
+        
+        // Update state display
+        function updateStateDisplay(state) {
+            const emojis = {
+                quiet: '🔇',
+                starting: '🎤',
+                speaking: '🗣️',
+                stopping: '⏹️'
+            };
+            
+            stateDisplay.textContent = `${emojis[state] || '🎤'} ${state.toUpperCase()}`;
+            stateDisplay.className = `state ${state}`;
+        }
+        
+        // Start recording and listening
+        async function startRecording() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    audio: { 
+                        sampleRate: 16000, 
+                        channelCount: 1,
+                        echoCancellation: false,
+                        noiseSuppression: false
+                    }
+                });
+                
+                audioContext = new AudioContext({ sampleRate: 16000 });
+                const source = audioContext.createMediaStreamSource(stream);
+                const processor = audioContext.createScriptProcessor(512, 1, 1);
+                
+                processor.onaudioprocess = (e) => {
+                    if (!isListening || ws?.readyState !== WebSocket.OPEN) return;
+                    
+                    const samples = e.inputBuffer.getChannelData(0);
+                    const buffer = new Float32Array(samples);
+                    const base64 = btoa(String.fromCharCode(...new Uint8Array(buffer.buffer)));
+                    
+                    ws.send(JSON.stringify({ type: "audio", data: base64 }));
+                };
+                
+                source.connect(processor);
+                processor.connect(audioContext.destination);
+                
+                // Start listening and recording
+                isListening = true;
+                ws.send(JSON.stringify({ type: "start_recording" }));
+                
+                startBtn.textContent = 'Stop Recording';
+                startBtn.className = 'stop';
+                startBtn.onclick = stopRecording;
+                
+            } catch (error) {
+                alert('Microphone access required');
+                console.error('Microphone error:', error);
+            }
+        }
+        
+        // Stop recording and listening
+        function stopRecording() {
+            isListening = false;
+            audioContext?.close();
+            audioContext = null;
+            
+            if (ws?.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: "stop_recording" }));
+            }
+            
+            startBtn.textContent = 'Start Recording';
+            startBtn.className = 'start';
+            startBtn.onclick = startRecording;
+        }
+        
+        // Reset system
+        function reset() {
+            if (isListening) {
+                stopRecording();
+            }
+            
+            if (ws?.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: "reset" }));
+            }
+            
+            // Reset UI
+            currentProb.textContent = '0.000';
+            smoothedProb.textContent = '0.000';
+            segmentCount.textContent = '0';
+            currentDuration.textContent = '0.0s';
+            updateStateDisplay('quiet');
+        }
+        
+        // Initialize
+        startBtn.onclick = startRecording;
+        document.getElementById('resetBtn').onclick = reset;
+        
+        connect();
+    </script>
+</body>
+</html>
