@@ -1,8 +1,6 @@
 import json
-import base64
 import numpy as np
 import onnxruntime as ort
-from torch import threshold
 from transformers import WhisperFeatureExtractor
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
@@ -10,30 +8,28 @@ import wave
 from datetime import datetime
 from enum import Enum
 from typing import Optional, List
+from transcriber import RealtimeTranscriber
 
 # Configuration
 ALPHA = 0.1
-THRESHOLD = 0.5
-START_DELTA = 0.2
-STOP_DELTA = 0.3
-FALLBACK_THRESHOLD = 0.1
+START_THRESHOLD = 0.3
+SPEAKING_THRESHOLD = 0.5
+STOP_THRESHOLD = 0.2
+QUIET_THRESHOLD = 0.1
+
+# Feature flags
+ENABLE_RECORDING = False
+ENABLE_TRANSCRIPTION = True
+
+# Safety margins
+SAFETY_CHUNKS_BEFORE = 2
+SAFETY_CHUNKS_AFTER = 2
 
 class SpeechState(Enum):
     QUIET = "quiet"
     STARTING = "starting"
     SPEAKING = "speaking"
     STOPPING = "stopping"
-
-class SpeechSegment:
-    def __init__(self, start_time: float):
-        self.start_time = start_time
-        self.end_time: Optional[float] = None
-    
-    def finalize(self, end_time: float):
-        self.end_time = end_time
-    
-    def duration(self) -> float:
-        return self.end_time - self.start_time if self.end_time else 0.0
 
 class EndOfUtteranceDetector:
     def __init__(self, model_path: str = "smart_turn_v3.onnx"):
@@ -88,6 +84,68 @@ class EndOfUtteranceDetector:
     def reset(self):
         self.audio_buffer = np.array([], dtype=np.float32)
 
+class SpeechSegmentBuffer:
+    """Manages audio buffering with safety margins."""
+    
+    def __init__(self, safety_before: int = SAFETY_CHUNKS_BEFORE, 
+                 safety_after: int = SAFETY_CHUNKS_AFTER):
+        self.safety_before = safety_before
+        self.safety_after = safety_after
+        self.pre_buffer = []
+        self.active_segment = []
+        self.post_buffer_count = 0
+        self.is_capturing = False
+        
+    def add_chunk(self, chunk: np.ndarray, state: SpeechState):
+        """Add audio chunk based on current state."""
+        if state == SpeechState.QUIET:
+            # Always maintain rolling pre-buffer for next speech segment
+            self.pre_buffer.append(chunk.copy())
+            if len(self.pre_buffer) > self.safety_before:
+                self.pre_buffer.pop(0)
+            self.post_buffer_count = 0
+                
+        elif state == SpeechState.STARTING:
+            if not self.is_capturing:
+                # Start capturing with ALL pre-buffer chunks
+                self.is_capturing = True
+                self.active_segment = [c.copy() for c in self.pre_buffer]
+                # Keep pre_buffer intact for continuous rolling window
+            self.active_segment.append(chunk.copy())
+            # Also add to pre_buffer to maintain rolling window
+            self.pre_buffer.append(chunk.copy())
+            if len(self.pre_buffer) > self.safety_before:
+                self.pre_buffer.pop(0)
+            self.post_buffer_count = 0
+            
+        elif state == SpeechState.SPEAKING:
+            self.active_segment.append(chunk.copy())
+            self.post_buffer_count = 0
+            
+        elif state == SpeechState.STOPPING:
+            self.active_segment.append(chunk.copy())
+            self.post_buffer_count += 1
+    
+    def has_safety_margin(self) -> bool:
+        """Check if we've collected enough post-stop chunks."""
+        return self.post_buffer_count >= self.safety_after
+    
+    def get_segment(self) -> Optional[np.ndarray]:
+        """Get complete segment and reset."""
+        if not self.active_segment:
+            return None
+        
+        segment = np.concatenate(self.active_segment)
+        self.reset()
+        return segment
+    
+    def reset(self):
+        """Reset segment capture but preserve pre_buffer for next segment."""
+        self.active_segment = []
+        self.post_buffer_count = 0
+        self.is_capturing = False
+        # Note: pre_buffer is NOT reset to maintain continuity
+
 class SpeechDetector:
     def __init__(self):
         # VAD
@@ -103,130 +161,185 @@ class SpeechDetector:
         except Exception as e:
             print(f"EOU unavailable: {e}")
         
+        # Transcriber with warm-up
+        self.transcriber = None
+        self.last_transcript = ""
+        if ENABLE_TRANSCRIPTION:
+            self.transcriber = RealtimeTranscriber()
+            self._warmup_transcriber()
+        
         # State
         self.state = SpeechState.QUIET
         self.smoothed_prob = 0.0
+        self.current_prob = 0.0
         self.chunk_count = 0
         
-        # Recording
-        self.is_recording = False
+        # Buffers
+        self.segment_buffer = SpeechSegmentBuffer()
+        self.is_listening = False
         self.full_audio: List[np.ndarray] = []
-        self.speech_segments: List[SpeechSegment] = []
-        self.current_segment: Optional[SpeechSegment] = None
+        self.segment_count = 0
     
-    def start_recording(self):
-        self.is_recording = True
+    def _warmup_transcriber(self):
+        """Warm up Whisper model."""
+        print("Warming up transcription model...")
+        dummy_audio = np.random.randn(16000).astype(np.float32) * 0.001
+        try:
+            self.transcriber.transcribe(dummy_audio, initial_prompt="")
+            print("Transcription model ready")
+        except Exception as e:
+            print(f"Warmup warning: {e}")
+    
+    def start_listening(self):
+        self.is_listening = True
         self.full_audio = []
-        self.speech_segments = []
-        self.current_segment = None
+        self.segment_count = 0
         self.chunk_count = 0
-        print("Recording started")
+        self.last_transcript = ""
+        print("Listening started")
     
-    def stop_recording(self):
-        self.is_recording = False
+    def stop_listening(self):
+        self.is_listening = False
         
-        # Save full audio
-        if self.full_audio:
+        if ENABLE_RECORDING and self.full_audio:
             full_audio_array = np.concatenate(self.full_audio)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"full_recording_{timestamp}.wav"
+            filename = f"recording_{timestamp}.wav"
             self._save_wav(full_audio_array, filename)
-            print(f"Full recording saved: {filename}")
+            print(f"Recording saved: {filename}")
         
-        # Finalize current segment if any
-        if self.current_segment:
-            current_time = self.chunk_count * 512 / 16000
-            self.current_segment.finalize(current_time)
-            self.speech_segments.append(self.current_segment)
-            self.current_segment = None
-        
-        # Print all speech segments
-        print("\n=== SPEECH SEGMENTS ===")
-        for i, segment in enumerate(self.speech_segments):
-            print(f"Segment {i+1}: {segment.start_time:.2f}s - {segment.end_time:.2f}s (Duration: {segment.duration():.2f}s)")
-        print(f"Total segments: {len(self.speech_segments)}\n")
+        print(f"Total segments: {self.segment_count}\n")
     
     def process_chunk(self, audio_chunk: np.ndarray):
-        if not self.is_recording:
-            return []
-        
+        """Process audio chunk - called continuously regardless of listening state."""
         self.chunk_count += 1
-        current_time = self.chunk_count * 512 / 16000
         
-        # Store full audio
-        self.full_audio.append(audio_chunk.copy())
-        
-        # VAD processing
+        # Get VAD probability
         prob = self._get_vad_probability(audio_chunk)
-        self._current_prob = prob  # Store current chunk probability
+        self.current_prob = prob
         self.smoothed_prob = ALPHA * prob + (1.0 - ALPHA) * self.smoothed_prob
         
-        # Add to EOU buffer and run analysis only in stopping state
-        eou_result = None
-        if self.eou and self.state == SpeechState.STOPPING:
-            self.eou.add_audio_chunk(audio_chunk)
-            if self.eou.has_sufficient_audio():
-                eou_result = self.eou.analyze()
-                print(f"EOU Analysis - Smoothed Prob: {self.smoothed_prob:.3f}, EOU Confidence: {eou_result['confidence']:.3f}, Utterance Ended: {eou_result['utterance_ended']}")
-        elif self.eou and self.state != SpeechState.QUIET:
-            # Only add to buffer if not in quiet state, but don't analyze unless stopping
+        # If not listening, just update VAD and return
+        if not self.is_listening:
+            return []
+        
+        # Store for recording if enabled
+        if ENABLE_RECORDING:
+            self.full_audio.append(audio_chunk.copy())
+        
+        # Add to segment buffer
+        self.segment_buffer.add_chunk(audio_chunk, self.state)
+        
+        # Add to EOU buffer when speaking/stopping
+        if self.eou and self.state in [SpeechState.SPEAKING, SpeechState.STOPPING]:
             self.eou.add_audio_chunk(audio_chunk)
         
         # State machine
+        return self._update_state()
+    
+    def _update_state(self):
+        """Update state machine and return events."""
         events = []
         
         if self.state == SpeechState.QUIET:
-            if self.smoothed_prob > THRESHOLD - START_DELTA:    # 0.3 (starting with 0.0)
+            if self.smoothed_prob >= START_THRESHOLD:
                 self.state = SpeechState.STARTING
-                self.current_segment = SpeechSegment(current_time)
                 events.append("speech_starting")
-                print(f"Starting speech detection at {current_time:.2f}s")
         
         elif self.state == SpeechState.STARTING:
-            if self.smoothed_prob > THRESHOLD + START_DELTA:
+            if self.smoothed_prob >= SPEAKING_THRESHOLD:
                 self.state = SpeechState.SPEAKING
                 events.append("speech_started")
+            elif self.smoothed_prob < QUIET_THRESHOLD:
+                # False start - reset transcript context and buffer
+                self.state = SpeechState.QUIET
+                self.segment_buffer.reset()
+                self.last_transcript = ""
         
         elif self.state == SpeechState.SPEAKING:
-            if self.smoothed_prob < THRESHOLD - STOP_DELTA:
+            if self.smoothed_prob < STOP_THRESHOLD:
                 self.state = SpeechState.STOPPING
                 events.append("speech_stopping")
         
         elif self.state == SpeechState.STOPPING:
-            self.eou.add_audio_chunk(audio_chunk)
+            # Check if should finalize
+            should_finalize = False
+            
+            # Priority 1: EOU detection
             if self.eou and self.eou.has_sufficient_audio():
                 eou_result = self.eou.analyze()
                 if eou_result['utterance_ended'] and eou_result['confidence'] > 0.9:
-                    self.state = SpeechState.QUIET
-                    self._finalize_current_segment(current_time, "VAD + Smart Turn Model")
-                    events.append("speech_ended")
-
-            if self.state != SpeechState.QUIET and self.smoothed_prob <= FALLBACK_THRESHOLD:
+                    should_finalize = True
+            
+            # Priority 2: After safety margin, check if truly quiet
+            if not should_finalize and self.segment_buffer.has_safety_margin():
+                if self.smoothed_prob < QUIET_THRESHOLD:
+                    should_finalize = True
+            
+            if should_finalize:
+                # Determine if this is end of utterance or just a pause
+                going_to_quiet = self.smoothed_prob < QUIET_THRESHOLD
+                
+                # Process segment with appropriate context
+                transcript = self._process_segment(
+                    use_context=not going_to_quiet  # Use context only if continuing
+                )
+                
                 self.state = SpeechState.QUIET
-                self._finalize_current_segment(current_time, "VAD + Fallback Model")
                 events.append("speech_ended")
-                print(f"Speech ended - EOU confirmed utterance completion")
-
-            if self.smoothed_prob > THRESHOLD - START_DELTA:
-                self.state = SpeechState.STARTING
-                events.append("speech_started")
+                
+                # Reset context if going to quiet (full stop)
+                if going_to_quiet:
+                    self.last_transcript = ""
+                
+                if transcript:
+                    events.append(("transcript", transcript))
+                
+                if self.eou:
+                    self.eou.reset()
+            
+            # Resume speaking if VAD increases
+            elif self.smoothed_prob > SPEAKING_THRESHOLD:
+                self.state = SpeechState.SPEAKING
+                events.append("speech_resumed")
+                self.segment_buffer.post_buffer_count = 0
         
         return events
     
-    def _finalize_current_segment(self, end_time: float, quiet_reason: str):
-        if self.current_segment:
-            self.current_segment.finalize(end_time)
-            self.speech_segments.append(self.current_segment)
-            print(f"Segment finalized: {self.current_segment.duration():.2f}s, cause: {quiet_reason}")
-            self.current_segment = None
-    
-    def _determine_quiet_reason(self) -> str:
-        # This method is now only used for fallback cases in starting state
-        if self.smoothed_prob < FALLBACK_THRESHOLD:
-            return "VAD with fallback threshold"
-        return "VAD standard threshold"
+    def _process_segment(self, use_context: bool = True) -> Optional[str]:
+        """Process completed speech segment.
+        
+        Args:
+            use_context: If True, use last_transcript as initial_prompt for continuity.
+                        If False, transcribe without context (clean slate).
+        """
+        self.segment_count += 1
+        
+        if not ENABLE_TRANSCRIPTION or not self.transcriber:
+            self.segment_buffer.reset()
+            return None
+        
+        segment_array = self.segment_buffer.get_segment()
+        
+        if segment_array is None or len(segment_array) < 16000 * 0.3:
+            print(f"Segment {self.segment_count}: Too short")
+            return None
+        
+        # Transcribe with or without context
+        initial_prompt = self.last_transcript if use_context else ""
+        transcript = self.transcriber.transcribe(segment_array, initial_prompt=initial_prompt)
+        
+        if transcript:
+            context_info = "with context" if use_context and initial_prompt else "no context"
+            print(f"Segment {self.segment_count} ({context_info}): {transcript}")
+            
+            # Update context for next transcription (will be used if use_context=True)
+            self.last_transcript = transcript[-200:] if len(transcript) > 200 else transcript
+        
+        return transcript
     
     def _get_vad_probability(self, chunk):
+        """Get VAD probability for chunk."""
         x = np.concatenate([self._vad_context, chunk.reshape(1, -1)], axis=1)
         out, self._vad_state = self.vad_session.run(
             None, 
@@ -236,6 +349,7 @@ class SpeechDetector:
         return float(out[0][0])
     
     def _save_wav(self, audio_array: np.ndarray, filename: str):
+        """Save audio to WAV file."""
         audio_int16 = (audio_array * 32767).astype(np.int16)
         with wave.open(filename, 'wb') as wav_file:
             wav_file.setnchannels(1)
@@ -244,26 +358,26 @@ class SpeechDetector:
             wav_file.writeframes(audio_int16.tobytes())
     
     def get_current_state(self) -> dict:
+        """Get current state for UI."""
         return {
             'state': self.state.value,
-            'current_prob': float(getattr(self, '_current_prob', 0.0)),
+            'current_prob': float(self.current_prob),
             'smoothed_prob': float(self.smoothed_prob),
-            'segments_count': len(self.speech_segments),
-            'is_recording': self.is_recording,
-            'current_segment_duration': float(
-                (self.chunk_count * 512 / 16000) - self.current_segment.start_time 
-                if self.current_segment else 0
-            )
+            'segments_count': self.segment_count,
+            'is_listening': self.is_listening,
         }
     
     def reset(self):
+        """Reset detector state."""
         self.state = SpeechState.QUIET
         self.smoothed_prob = 0.0
+        self.current_prob = 0.0
         self.chunk_count = 0
-        self.is_recording = False
+        self.is_listening = False
         self.full_audio = []
-        self.speech_segments = []
-        self.current_segment = None
+        self.segment_count = 0
+        self.last_transcript = ""
+        self.segment_buffer.reset()
         
         if self.eou:
             self.eou.reset()
@@ -285,37 +399,48 @@ async def websocket_endpoint(websocket: WebSocket):
     
     try:
         while True:
-            data = await websocket.receive_text()
-            message = json.loads(data)
+            message = await websocket.receive()
             
-            if message["type"] == "audio":
-                audio_bytes = base64.b64decode(message["data"])
-                audio_array = np.frombuffer(audio_bytes, dtype=np.float32)
+            # Binary audio data
+            if "bytes" in message:
+                audio_array = np.frombuffer(message["bytes"], dtype=np.float32)
                 
                 if len(audio_array) == 512:
                     events = detector.process_chunk(audio_array)
                     
-                    if events:
-                        response = {
-                            "events": events,
-                            "state": detector.get_current_state()
-                        }
-                        await websocket.send_text(json.dumps(response))
+                    # Always send state updates, even if no events
+                    response = {
+                        "events": [e if isinstance(e, str) else e[0] for e in events] if events else [],
+                        "state": detector.get_current_state()
+                    }
+                    
+                    # Add transcript if present
+                    for event in events:
+                        if isinstance(event, tuple) and event[0] == "transcript":
+                            response["transcript"] = event[1]
+                    
+                    await websocket.send_text(json.dumps(response))
             
-            elif message["type"] == "start_recording":
-                detector.start_recording()
-                await websocket.send_text(json.dumps({"recording_started": True}))
-            
-            elif message["type"] == "stop_recording":
-                detector.stop_recording()
-                await websocket.send_text(json.dumps({"recording_stopped": True}))
-            
-            elif message["type"] == "reset":
-                detector.reset()
-                await websocket.send_text(json.dumps({"reset": "ok"}))
+            # Text commands
+            elif "text" in message:
+                data = json.loads(message["text"])
+                
+                if data["type"] == "start_listening":
+                    detector.start_listening()
+                    await websocket.send_text(json.dumps({"listening_started": True}))
+                
+                elif data["type"] == "stop_listening":
+                    detector.stop_listening()
+                    await websocket.send_text(json.dumps({"listening_stopped": True}))
+                
+                elif data["type"] == "reset":
+                    detector.reset()
+                    await websocket.send_text(json.dumps({"reset": "ok"}))
                 
     except WebSocketDisconnect:
         print("Client disconnected")
+    except Exception as e:
+        print(f"WebSocket error: {e}")
 
 if __name__ == "__main__":
     import uvicorn

@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Speech Detection - Simplified</title>
+    <title>Speech Detection with Transcription</title>
     <style>
         body {
             font-family: 'Segoe UI', sans-serif;
@@ -24,7 +24,8 @@
             text-align: center;
             box-shadow: 0 10px 30px rgba(0,0,0,0.2);
             min-width: 450px;
-            max-width: 600px;
+            max-width: 700px;
+            width: 100%;
         }
         
         h1 {
@@ -80,6 +81,34 @@
         @keyframes fadeOut {
             0% { opacity: 1; }
             100% { opacity: 0.6; }
+        }
+        
+        .transcript-container {
+            background: #f8f9fa;
+            border-radius: 15px;
+            padding: 20px;
+            margin: 20px 0;
+            min-height: 120px;
+            text-align: left;
+            border: 2px solid #e0e0e0;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        
+        .transcript-label {
+            font-size: 14px;
+            color: #666;
+            font-weight: bold;
+            margin-bottom: 10px;
+            text-transform: uppercase;
+        }
+        
+        .transcript-text {
+            font-size: 18px;
+            line-height: 1.6;
+            word-wrap: break-word;
+            color: #333;
+            white-space: pre-wrap;
         }
         
         .metrics {
@@ -158,7 +187,7 @@
         .connected { background: #4CAF50; color: white; }
         .disconnected { background: #f44336; color: white; }
         
-        .recording-indicator {
+        .listening-indicator {
             position: fixed;
             top: 20px;
             left: 20px;
@@ -172,25 +201,45 @@
             display: none;
         }
         
-        .recording-indicator.active {
+        .listening-indicator.active {
             display: block;
-            animation: recordingBlink 1s ease-in-out infinite alternate;
+            animation: listeningBlink 1s ease-in-out infinite alternate;
         }
         
-        @keyframes recordingBlink {
+        @keyframes listeningBlink {
             0% { opacity: 1; }
             100% { opacity: 0.5; }
+        }
+
+        .protocol-indicator {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            padding: 6px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            background: #667eea;
+            color: white;
+            z-index: 1000;
         }
     </style>
 </head>
 <body>
     <div class="connection" id="connection">Disconnected</div>
-    <div class="recording-indicator" id="recordingIndicator">🔴 RECORDING</div>
+    <div class="listening-indicator" id="listeningIndicator">🎤 LISTENING</div>
+    <div class="protocol-indicator">⚡ Binary Protocol</div>
     
     <div class="container">
-        <h1>🎤 Speech Detection</h1>
+        <h1>🎤 Speech Detection & Transcription</h1>
         
         <div class="state quiet" id="stateDisplay">🔇 QUIET</div>
+        
+        <div class="transcript-container">
+            <div class="transcript-label">📝 Transcriptions</div>
+            <div class="transcript-text" id="transcriptDisplay">
+                <em style="color: #999;">Transcriptions will appear here...</em>
+            </div>
+        </div>
         
         <div class="metrics">
             <div class="metric">
@@ -206,13 +255,17 @@
                 <div class="metric-value" id="segmentCount">0</div>
             </div>
             <div class="metric">
-                <div class="metric-label">Current Duration</div>
-                <div class="metric-value" id="currentDuration">0.0s</div>
+                <div class="metric-label">Last Latency</div>
+                <div class="metric-value" id="lastLatency">-</div>
+            </div>
+            <div class="metric">
+                <div class="metric-label">Avg Latency</div>
+                <div class="metric-value" id="avgLatency">-</div>
             </div>
         </div>
         
         <div class="controls">
-            <button class="start" id="startBtn">Start Recording</button>
+            <button class="start" id="startBtn">Start Listening</button>
             <button class="reset" id="resetBtn">Reset</button>
         </div>
     </div>
@@ -221,46 +274,104 @@
         let ws = null;
         let audioContext = null;
         let isListening = false;
-        let isRecording = false;
+        let isActive = false;
         
         const stateDisplay = document.getElementById('stateDisplay');
         const startBtn = document.getElementById('startBtn');
         const connection = document.getElementById('connection');
-        const recordingIndicator = document.getElementById('recordingIndicator');
+        const listeningIndicator = document.getElementById('listeningIndicator');
         const currentProb = document.getElementById('currentProb');
         const smoothedProb = document.getElementById('smoothedProb');
         const segmentCount = document.getElementById('segmentCount');
-        const currentDuration = document.getElementById('currentDuration');
+        const lastLatency = document.getElementById('lastLatency');
+        const avgLatency = document.getElementById('avgLatency');
+        const transcriptDisplay = document.getElementById('transcriptDisplay');
+        
+        let fullTranscript = '';
+        let latencies = [];
+        let segmentStartTime = null;
         
         // Connect WebSocket
         function connect() {
             const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
             ws = new WebSocket(`${protocol}//${location.host}/ws`);
+            ws.binaryType = 'arraybuffer';
             
             ws.onopen = () => {
                 connection.textContent = 'Connected';
                 connection.className = 'connection connected';
+                console.log('WebSocket connected');
             };
             
             ws.onclose = () => {
                 connection.textContent = 'Disconnected';
                 connection.className = 'connection disconnected';
+                console.log('WebSocket disconnected, reconnecting...');
                 setTimeout(connect, 3000);
             };
             
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+            };
+            
             ws.onmessage = (event) => {
-                const data = JSON.parse(event.data);
-                
-                if (data.events && data.state) {
-                    handleStateUpdate(data.state);
-                } else if (data.recording_started) {
-                    isRecording = true;
-                    recordingIndicator.className = 'recording-indicator active';
-                } else if (data.recording_stopped) {
-                    isRecording = false;
-                    recordingIndicator.className = 'recording-indicator';
+                // Server sends JSON responses
+                try {
+                    const data = JSON.parse(event.data);
+                    
+                    if (data.events && data.state) {
+                        handleStateUpdate(data.state);
+                        
+                        // Track segment timing
+                        if (data.events.includes('speech_stopping')) {
+                            segmentStartTime = Date.now();
+                        }
+                        
+                        if (data.transcript) {
+                            const latency = segmentStartTime ? Date.now() - segmentStartTime : 0;
+                            addTranscript(data.transcript, latency);
+                        }
+                    } else if (data.listening_started) {
+                        isActive = true;
+                        listeningIndicator.className = 'listening-indicator active';
+                        console.log('Listening started');
+                    } else if (data.listening_stopped) {
+                        isActive = false;
+                        listeningIndicator.className = 'listening-indicator';
+                        console.log('Listening stopped');
+                    } else if (data.reset) {
+                        console.log('System reset');
+                    }
+                } catch (e) {
+                    console.error('Error parsing message:', e);
                 }
             };
+        }
+        
+        // Add transcript
+        function addTranscript(text, latency) {
+            if (!text) return;
+            
+            // Clear placeholder on first transcript
+            if (!fullTranscript) {
+                transcriptDisplay.textContent = '';
+            }
+            
+            // Append to continuous transcript with space
+            fullTranscript += (fullTranscript ? ' ' : '') + text.trim();
+            transcriptDisplay.textContent = fullTranscript;
+            
+            // Update latency metrics
+            if (latency > 0) {
+                latencies.push(latency);
+                lastLatency.textContent = `${(latency / 1000).toFixed(2)}s`;
+                
+                const avg = latencies.reduce((a, b) => a + b, 0) / latencies.length;
+                avgLatency.textContent = `${(avg / 1000).toFixed(2)}s`;
+            }
+            
+            // Scroll to bottom
+            transcriptDisplay.scrollTop = transcriptDisplay.scrollHeight;
         }
         
         // Handle state updates
@@ -269,7 +380,6 @@
             currentProb.textContent = (state.current_prob || 0).toFixed(3);
             smoothedProb.textContent = state.smoothed_prob.toFixed(3);
             segmentCount.textContent = state.segments_count;
-            currentDuration.textContent = state.current_segment_duration.toFixed(1) + 's';
         }
         
         // Update state display
@@ -285,8 +395,8 @@
             stateDisplay.className = `state ${state}`;
         }
         
-        // Start recording and listening
-        async function startRecording() {
+        // Start listening
+        async function startListening() {
             try {
                 const stream = await navigator.mediaDevices.getUserMedia({
                     audio: { 
@@ -302,25 +412,32 @@
                 const processor = audioContext.createScriptProcessor(512, 1, 1);
                 
                 processor.onaudioprocess = (e) => {
-                    if (!isListening || ws?.readyState !== WebSocket.OPEN) return;
+                    // ALWAYS send audio chunks, regardless of listening state
+                    // This ensures VAD and state machine keep running
+                    if (ws?.readyState !== WebSocket.OPEN) return;
                     
                     const samples = e.inputBuffer.getChannelData(0);
                     const buffer = new Float32Array(samples);
-                    const base64 = btoa(String.fromCharCode(...new Uint8Array(buffer.buffer)));
                     
-                    ws.send(JSON.stringify({ type: "audio", data: base64 }));
+                    // Send as binary (more efficient than base64 JSON)
+                    ws.send(buffer.buffer);
                 };
                 
                 source.connect(processor);
                 processor.connect(audioContext.destination);
                 
-                // Start listening and recording
                 isListening = true;
-                ws.send(JSON.stringify({ type: "start_recording" }));
                 
-                startBtn.textContent = 'Stop Recording';
+                // Send start command
+                if (ws?.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: "start_listening" }));
+                }
+                
+                startBtn.textContent = 'Stop Listening';
                 startBtn.className = 'stop';
-                startBtn.onclick = stopRecording;
+                startBtn.onclick = stopListening;
+                
+                console.log('Microphone started');
                 
             } catch (error) {
                 alert('Microphone access required');
@@ -328,25 +445,30 @@
             }
         }
         
-        // Stop recording and listening
-        function stopRecording() {
+        // Stop listening
+        function stopListening() {
             isListening = false;
-            audioContext?.close();
-            audioContext = null;
             
-            if (ws?.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: "stop_recording" }));
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
             }
             
-            startBtn.textContent = 'Start Recording';
+            if (ws?.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({ type: "stop_listening" }));
+            }
+            
+            startBtn.textContent = 'Start Listening';
             startBtn.className = 'start';
-            startBtn.onclick = startRecording;
+            startBtn.onclick = startListening;
+            
+            console.log('Microphone stopped');
         }
         
         // Reset system
         function reset() {
             if (isListening) {
-                stopRecording();
+                stopListening();
             }
             
             if (ws?.readyState === WebSocket.OPEN) {
@@ -357,12 +479,21 @@
             currentProb.textContent = '0.000';
             smoothedProb.textContent = '0.000';
             segmentCount.textContent = '0';
-            currentDuration.textContent = '0.0s';
+            lastLatency.textContent = '-';
+            avgLatency.textContent = '-';
             updateStateDisplay('quiet');
+            
+            // Clear transcripts
+            fullTranscript = '';
+            latencies = [];
+            segmentStartTime = null;
+            transcriptDisplay.innerHTML = '<em style="color: #999;">Transcriptions will appear here...</em>';
+            
+            console.log('UI reset');
         }
         
         // Initialize
-        startBtn.onclick = startRecording;
+        startBtn.onclick = startListening;
         document.getElementById('resetBtn').onclick = reset;
         
         connect();
