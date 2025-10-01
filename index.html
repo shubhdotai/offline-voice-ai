@@ -113,7 +113,7 @@
         
         .metrics {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+            grid-template-columns: repeat(3, 1fr);
             gap: 15px;
             margin: 20px 0;
             text-align: center;
@@ -121,7 +121,7 @@
         
         .metric {
             background: #f8f9fa;
-            padding: 15px;
+            padding: 20px;
             border-radius: 10px;
             border-left: 4px solid #667eea;
         }
@@ -130,11 +130,12 @@
             font-size: 12px;
             color: #666;
             text-transform: uppercase;
-            margin-bottom: 5px;
+            margin-bottom: 8px;
+            font-weight: 600;
         }
         
         .metric-value {
-            font-size: 18px;
+            font-size: 24px;
             font-weight: bold;
             color: #333;
         }
@@ -210,24 +211,11 @@
             0% { opacity: 1; }
             100% { opacity: 0.5; }
         }
-
-        .protocol-indicator {
-            position: fixed;
-            bottom: 20px;
-            right: 20px;
-            padding: 6px 12px;
-            border-radius: 12px;
-            font-size: 12px;
-            background: #667eea;
-            color: white;
-            z-index: 1000;
-        }
     </style>
 </head>
 <body>
     <div class="connection" id="connection">Disconnected</div>
     <div class="listening-indicator" id="listeningIndicator">🎤 LISTENING</div>
-    <div class="protocol-indicator">⚡ Binary Protocol</div>
     
     <div class="container">
         <h1>🎤 Speech Detection & Transcription</h1>
@@ -243,23 +231,15 @@
         
         <div class="metrics">
             <div class="metric">
-                <div class="metric-label">Current VAD</div>
-                <div class="metric-value" id="currentProb">0.000</div>
-            </div>
-            <div class="metric">
-                <div class="metric-label">Smoothed VAD</div>
-                <div class="metric-value" id="smoothedProb">0.000</div>
+                <div class="metric-label">VAD Probability</div>
+                <div class="metric-value" id="vadProb">0.000</div>
             </div>
             <div class="metric">
                 <div class="metric-label">Speech Segments</div>
                 <div class="metric-value" id="segmentCount">0</div>
             </div>
             <div class="metric">
-                <div class="metric-label">Last Latency</div>
-                <div class="metric-value" id="lastLatency">-</div>
-            </div>
-            <div class="metric">
-                <div class="metric-label">Avg Latency</div>
+                <div class="metric-label">Latency (avg)</div>
                 <div class="metric-value" id="avgLatency">-</div>
             </div>
         </div>
@@ -280,10 +260,8 @@
         const startBtn = document.getElementById('startBtn');
         const connection = document.getElementById('connection');
         const listeningIndicator = document.getElementById('listeningIndicator');
-        const currentProb = document.getElementById('currentProb');
-        const smoothedProb = document.getElementById('smoothedProb');
+        const vadProb = document.getElementById('vadProb');
         const segmentCount = document.getElementById('segmentCount');
-        const lastLatency = document.getElementById('lastLatency');
         const avgLatency = document.getElementById('avgLatency');
         const transcriptDisplay = document.getElementById('transcriptDisplay');
         
@@ -315,7 +293,6 @@
             };
             
             ws.onmessage = (event) => {
-                // Server sends JSON responses
                 try {
                     const data = JSON.parse(event.data);
                     
@@ -364,8 +341,6 @@
             // Update latency metrics
             if (latency > 0) {
                 latencies.push(latency);
-                lastLatency.textContent = `${(latency / 1000).toFixed(2)}s`;
-                
                 const avg = latencies.reduce((a, b) => a + b, 0) / latencies.length;
                 avgLatency.textContent = `${(avg / 1000).toFixed(2)}s`;
             }
@@ -377,8 +352,7 @@
         // Handle state updates
         function handleStateUpdate(state) {
             updateStateDisplay(state.state);
-            currentProb.textContent = (state.current_prob || 0).toFixed(3);
-            smoothedProb.textContent = state.smoothed_prob.toFixed(3);
+            vadProb.textContent = state.smoothed_prob.toFixed(3);
             segmentCount.textContent = state.segments_count;
         }
         
@@ -412,14 +386,11 @@
                 const processor = audioContext.createScriptProcessor(512, 1, 1);
                 
                 processor.onaudioprocess = (e) => {
-                    // ALWAYS send audio chunks, regardless of listening state
-                    // This ensures VAD and state machine keep running
                     if (ws?.readyState !== WebSocket.OPEN) return;
                     
                     const samples = e.inputBuffer.getChannelData(0);
                     const buffer = new Float32Array(samples);
                     
-                    // Send as binary (more efficient than base64 JSON)
                     ws.send(buffer.buffer);
                 };
                 
@@ -428,7 +399,6 @@
                 
                 isListening = true;
                 
-                // Send start command
                 if (ws?.readyState === WebSocket.OPEN) {
                     ws.send(JSON.stringify({ type: "start_listening" }));
                 }
@@ -476,10 +446,8 @@
             }
             
             // Reset UI
-            currentProb.textContent = '0.000';
-            smoothedProb.textContent = '0.000';
+            vadProb.textContent = '0.000';
             segmentCount.textContent = '0';
-            lastLatency.textContent = '-';
             avgLatency.textContent = '-';
             updateStateDisplay('quiet');
             

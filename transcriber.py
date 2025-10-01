@@ -1,6 +1,5 @@
 import numpy as np
 import mlx_whisper
-from typing import Optional
 import time
 
 
@@ -10,18 +9,17 @@ class RealtimeTranscriber:
         model_name: str = "mlx-community/whisper-small.en-mlx-q4",
         sample_rate: int = 16000,
     ):
-        """Real-time transcriber using MLX Whisper with optimizations."""
+        """Real-time transcriber using MLX Whisper."""
         print(f"Loading Whisper model: {model_name}")
         self.model = model_name
         self.sample_rate = sample_rate
         
-    def transcribe(self, audio_data: np.ndarray, initial_prompt: str = "") -> str:
+    def transcribe(self, audio_data: np.ndarray) -> str:
         """
-        Transcribe audio segment with contextual awareness.
+        Transcribe audio segment.
         
         Args:
             audio_data: Audio samples as numpy array
-            initial_prompt: Previous transcript for context continuity
             
         Returns:
             Transcribed text string
@@ -34,15 +32,15 @@ class RealtimeTranscriber:
             return ""
         
         try:
-            # Transcribe with context
             result = mlx_whisper.transcribe(
                 audio_data,
                 path_or_hf_repo=self.model,
                 verbose=False,
                 language="en",
                 fp16=False,
-                initial_prompt=initial_prompt,  # Context from previous transcript
-                condition_on_previous_text=True  # Enable contextual awareness
+                temperature=0.0,
+                no_speech_threshold=0.6,
+                compression_ratio_threshold=2.4,
             )
             
             end_time = time.monotonic()
