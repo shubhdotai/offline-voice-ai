@@ -4,7 +4,7 @@ Real-time speech-to-text system using VAD, End-of-Utterance detection, and MLX W
 
 ## Demo
 
-https://github.com/shubhdotai/real-time-transcriber/assets/demo.mp4
+[![Watch the demo](https://img.youtube.com/vi/uBqNq66qUos/maxresdefault.jpg)](https://www.youtube.com/watch?v=uBqNq66qUos)
 
 ## Features
 
