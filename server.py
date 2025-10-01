@@ -36,7 +36,7 @@ class SpeechState(Enum):
     STOPPING = "stopping"
 
 class EndOfUtteranceDetector:
-    def __init__(self, model_path: str = "smart_turn_v3.onnx"):
+    def __init__(self, model_path: str = "models/smart_turn_v3.onnx"):
         self.feature_extractor = WhisperFeatureExtractor(chunk_length=8)
         so = ort.SessionOptions()
         so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
@@ -165,14 +165,14 @@ class TranscriptionRequest:
 class SpeechDetector:
     def __init__(self):
         # VAD
-        self.vad_session = ort.InferenceSession('silero_vad.onnx')
+        self.vad_session = ort.InferenceSession('models/silero_vad.onnx')
         self._vad_state = np.zeros((2, 1, 128), dtype=np.float32)
         self._vad_context = np.zeros((1, 64), dtype=np.float32)
         
         # EOU
         self.eou = None
         try:
-            self.eou = EndOfUtteranceDetector("smart_turn_v3.onnx")
+            self.eou = EndOfUtteranceDetector("models/smart_turn_v3.onnx")
             print("EOU model loaded")
         except Exception as e:
             print(f"EOU unavailable: {e}")
