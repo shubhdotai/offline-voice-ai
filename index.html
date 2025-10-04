@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Speech Detection with Transcription</title>
+    <title>Voice Agent</title>
     <style>
         body {
             font-family: 'Segoe UI', sans-serif;
@@ -73,6 +73,13 @@
             animation: fadeOut 1s ease-in-out infinite alternate;
         }
         
+        .state.processing { 
+            background: #e3f2fd; 
+            color: #0d47a1; 
+            border: 2px solid #2196F3;
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+        
         @keyframes pulse {
             0%, 100% { transform: scale(1); opacity: 0.8; }
             50% { transform: scale(1.05); opacity: 1; }
@@ -109,6 +116,36 @@
             word-wrap: break-word;
             color: #333;
             white-space: pre-wrap;
+        }
+        
+        .message {
+            margin: 10px 0;
+            padding: 10px 15px;
+            border-radius: 10px;
+        }
+        
+        .message.user {
+            background: #e3f2fd;
+            text-align: left;
+        }
+        
+        .message.assistant {
+            background: #f1f8e9;
+            text-align: left;
+        }
+        
+        .message-label {
+            font-weight: bold;
+            font-size: 14px;
+            margin-bottom: 5px;
+        }
+        
+        .message.user .message-label {
+            color: #1976d2;
+        }
+        
+        .message.assistant .message-label {
+            color: #558b2f;
         }
         
         .metrics {
@@ -218,14 +255,14 @@
     <div class="listening-indicator" id="listeningIndicator">🎤 LISTENING</div>
     
     <div class="container">
-        <h1>🎤 Speech Detection & Transcription</h1>
+        <h1>🤖 Voice Agent</h1>
         
         <div class="state quiet" id="stateDisplay">🔇 QUIET</div>
         
         <div class="transcript-container">
-            <div class="transcript-label">📝 Transcriptions</div>
+            <div class="transcript-label">💬 Conversation</div>
             <div class="transcript-text" id="transcriptDisplay">
-                <em style="color: #999;">Transcriptions will appear here...</em>
+                <em style="color: #999;">Start speaking to begin conversation...</em>
             </div>
         </div>
         
@@ -239,8 +276,8 @@
                 <div class="metric-value" id="segmentCount">0</div>
             </div>
             <div class="metric">
-                <div class="metric-label">Latency (avg)</div>
-                <div class="metric-value" id="avgLatency">-</div>
+                <div class="metric-label">Status</div>
+                <div class="metric-value" id="statusValue">Ready</div>
             </div>
         </div>
         
@@ -249,12 +286,15 @@
             <button class="reset" id="resetBtn">Reset</button>
         </div>
     </div>
+    
+    <audio id="audioPlayer" style="display: none;"></audio>
 
     <script>
         let ws = null;
         let audioContext = null;
         let isListening = false;
         let isActive = false;
+        let audioPlayer = document.getElementById('audioPlayer');
         
         const stateDisplay = document.getElementById('stateDisplay');
         const startBtn = document.getElementById('startBtn');
@@ -262,12 +302,10 @@
         const listeningIndicator = document.getElementById('listeningIndicator');
         const vadProb = document.getElementById('vadProb');
         const segmentCount = document.getElementById('segmentCount');
-        const avgLatency = document.getElementById('avgLatency');
+        const statusValue = document.getElementById('statusValue');
         const transcriptDisplay = document.getElementById('transcriptDisplay');
         
-        let fullTranscript = '';
-        let latencies = [];
-        let segmentStartTime = null;
+        let conversationMessages = [];
         
         // Connect WebSocket
         function connect() {
@@ -292,31 +330,49 @@
                 console.error('WebSocket error:', error);
             };
             
-            ws.onmessage = (event) => {
+            ws.onmessage = async (event) => {
+                // Handle binary audio data
+                if (event.data instanceof ArrayBuffer) {
+                    console.log('Received audio data:', event.data.byteLength, 'bytes');
+                    await playAudioResponse(event.data);
+                    return;
+                }
+                
+                // Handle text messages
                 try {
                     const data = JSON.parse(event.data);
                     
                     if (data.events && data.state) {
                         handleStateUpdate(data.state);
                         
-                        // Track segment timing
-                        if (data.events.includes('speech_stopping')) {
-                            segmentStartTime = Date.now();
+                        if (data.events.includes('processing_started')) {
+                            updateStateDisplay('processing');
+                            statusValue.textContent = 'Processing';
                         }
                         
                         if (data.transcript) {
-                            const latency = segmentStartTime ? Date.now() - segmentStartTime : 0;
-                            addTranscript(data.transcript, latency);
+                            addMessage('user', data.transcript);
+                        }
+                        
+                        if (data.llm_response) {
+                            addMessage('assistant', data.llm_response);
+                        }
+                        
+                        if (data.events.includes('response_complete')) {
+                            statusValue.textContent = 'Ready';
                         }
                     } else if (data.listening_started) {
                         isActive = true;
                         listeningIndicator.className = 'listening-indicator active';
+                        statusValue.textContent = 'Listening';
                         console.log('Listening started');
                     } else if (data.listening_stopped) {
                         isActive = false;
                         listeningIndicator.className = 'listening-indicator';
+                        statusValue.textContent = 'Stopped';
                         console.log('Listening stopped');
                     } else if (data.reset) {
+                        statusValue.textContent = 'Ready';
                         console.log('System reset');
                     }
                 } catch (e) {
@@ -325,25 +381,71 @@
             };
         }
         
-        // Add transcript
-        function addTranscript(text, latency) {
+        // Play audio response
+        async function playAudioResponse(audioData) {
+            try {
+                console.log('Starting audio playback...');
+                statusValue.textContent = 'Speaking';
+                
+                // Create blob from array buffer
+                const blob = new Blob([audioData], { type: 'audio/wav' });
+                const url = URL.createObjectURL(blob);
+                
+                // Set up audio player
+                audioPlayer.src = url;
+                
+                // Play audio and wait for completion
+                await audioPlayer.play();
+                console.log('Audio is now playing...');
+                
+                // Wait for audio to finish
+                await new Promise((resolve) => {
+                    audioPlayer.onended = () => {
+                        URL.revokeObjectURL(url);
+                        resolve();
+                    };
+                });
+                
+                // Notify server that audio finished
+                if (ws?.readyState === WebSocket.OPEN) {
+                    ws.send(JSON.stringify({ type: "audio_finished" }));
+                }
+                
+                statusValue.textContent = 'Ready';
+                console.log('Audio playback complete');
+                
+            } catch (error) {
+                console.error('Error playing audio:', error);
+                statusValue.textContent = 'Error';
+            }
+        }
+        
+        // Add message to conversation
+        function addMessage(role, text) {
             if (!text) return;
             
-            // Clear placeholder on first transcript
-            if (!fullTranscript) {
+            // Clear placeholder on first message
+            if (conversationMessages.length === 0) {
                 transcriptDisplay.textContent = '';
             }
             
-            // Append to continuous transcript with space
-            fullTranscript += (fullTranscript ? ' ' : '') + text.trim();
-            transcriptDisplay.textContent = fullTranscript;
+            conversationMessages.push({ role, text });
             
-            // Update latency metrics
-            if (latency > 0) {
-                latencies.push(latency);
-                const avg = latencies.reduce((a, b) => a + b, 0) / latencies.length;
-                avgLatency.textContent = `${(avg / 1000).toFixed(2)}s`;
-            }
+            // Create message element
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${role}`;
+            
+            const labelDiv = document.createElement('div');
+            labelDiv.className = 'message-label';
+            labelDiv.textContent = role === 'user' ? 'You' : 'Assistant';
+            
+            const textDiv = document.createElement('div');
+            textDiv.textContent = text;
+            
+            messageDiv.appendChild(labelDiv);
+            messageDiv.appendChild(textDiv);
+            
+            transcriptDisplay.appendChild(messageDiv);
             
             // Scroll to bottom
             transcriptDisplay.scrollTop = transcriptDisplay.scrollHeight;
@@ -351,21 +453,25 @@
         
         // Handle state updates
         function handleStateUpdate(state) {
-            updateStateDisplay(state.state);
+            if (state.state) {
+                updateStateDisplay(state.state);
+            }
             vadProb.textContent = state.smoothed_prob.toFixed(3);
             segmentCount.textContent = state.segments_count;
         }
         
         // Update state display
         function updateStateDisplay(state) {
-            const emojis = {
-                quiet: '🔇',
-                starting: '🎤',
-                speaking: '🗣️',
-                stopping: '⏹️'
+            const stateConfig = {
+                quiet: { emoji: '🔇', text: 'QUIET' },
+                starting: { emoji: '🎤', text: 'STARTING' },
+                speaking: { emoji: '🗣️', text: 'SPEAKING' },
+                stopping: { emoji: '⏹️', text: 'STOPPING' },
+                processing: { emoji: '🤔', text: 'PROCESSING' }
             };
             
-            stateDisplay.textContent = `${emojis[state] || '🎤'} ${state.toUpperCase()}`;
+            const config = stateConfig[state] || stateConfig.quiet;
+            stateDisplay.textContent = `${config.emoji} ${config.text}`;
             stateDisplay.className = `state ${state}`;
         }
         
@@ -387,6 +493,11 @@
                 
                 processor.onaudioprocess = (e) => {
                     if (ws?.readyState !== WebSocket.OPEN) return;
+                    
+                    // Don't send audio while bot is speaking
+                    if (audioPlayer && !audioPlayer.paused) {
+                        return;
+                    }
                     
                     const samples = e.inputBuffer.getChannelData(0);
                     const buffer = new Float32Array(samples);
@@ -448,14 +559,12 @@
             // Reset UI
             vadProb.textContent = '0.000';
             segmentCount.textContent = '0';
-            avgLatency.textContent = '-';
+            statusValue.textContent = 'Ready';
             updateStateDisplay('quiet');
             
-            // Clear transcripts
-            fullTranscript = '';
-            latencies = [];
-            segmentStartTime = null;
-            transcriptDisplay.innerHTML = '<em style="color: #999;">Transcriptions will appear here...</em>';
+            // Clear conversation
+            conversationMessages = [];
+            transcriptDisplay.innerHTML = '<em style="color: #999;">Start speaking to begin conversation...</em>';
             
             console.log('UI reset');
         }

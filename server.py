@@ -9,6 +9,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional, List
 from transcriber import RealtimeTranscriber
+from llm_handler import LLMHandler
+from tts_handler import TTSHandler
 import asyncio
 
 # Configuration
@@ -23,11 +25,11 @@ ENABLE_RECORDING = False
 ENABLE_TRANSCRIPTION = True
 
 # Safety margins
-SAFETY_CHUNKS_BEFORE = 4    # 128ms
+SAFETY_CHUNKS_BEFORE = 4
 SAFETY_CHUNKS_AFTER = 2
 
 # Queue configuration
-MAX_TRANSCRIPTION_QUEUE_SIZE = 2  # Only keep 2 pending transcriptions max
+MAX_TRANSCRIPTION_QUEUE_SIZE = 2
 
 class SpeechState(Enum):
     QUIET = "quiet"
@@ -89,8 +91,6 @@ class EndOfUtteranceDetector:
         self.audio_buffer = np.array([], dtype=np.float32)
 
 class SpeechSegmentBuffer:
-    """Manages audio buffering with safety margins."""
-    
     def __init__(self, safety_before: int = SAFETY_CHUNKS_BEFORE, 
                  safety_after: int = SAFETY_CHUNKS_AFTER):
         self.safety_before = safety_before
@@ -101,9 +101,7 @@ class SpeechSegmentBuffer:
         self.is_capturing = False
         
     def add_chunk(self, chunk: np.ndarray, state: SpeechState):
-        """Add audio chunk based on current state."""
         if state == SpeechState.QUIET:
-            # Always maintain rolling pre-buffer for next speech segment
             self.pre_buffer.append(chunk.copy())
             if len(self.pre_buffer) > self.safety_before:
                 self.pre_buffer.pop(0)
@@ -111,11 +109,9 @@ class SpeechSegmentBuffer:
                 
         elif state == SpeechState.STARTING:
             if not self.is_capturing:
-                # Start capturing with ALL pre-buffer chunks
                 self.is_capturing = True
                 self.active_segment = [c.copy() for c in self.pre_buffer]
             self.active_segment.append(chunk.copy())
-            # Also maintain pre_buffer rolling window
             self.pre_buffer.append(chunk.copy())
             if len(self.pre_buffer) > self.safety_before:
                 self.pre_buffer.pop(0)
@@ -130,17 +126,14 @@ class SpeechSegmentBuffer:
             self.post_buffer_count += 1
     
     def has_safety_margin(self) -> bool:
-        """Check if we've collected enough post-stop chunks."""
         return self.post_buffer_count >= self.safety_after
     
     def get_segment_copy(self) -> Optional[np.ndarray]:
-        """Get copy of current segment without resetting."""
         if not self.active_segment:
             return None
         return np.concatenate(self.active_segment)
     
     def get_segment(self) -> Optional[np.ndarray]:
-        """Get complete segment and reset."""
         if not self.active_segment:
             return None
         
@@ -149,13 +142,11 @@ class SpeechSegmentBuffer:
         return segment
     
     def reset(self):
-        """Reset segment capture but preserve pre_buffer for next segment."""
         self.active_segment = []
         self.post_buffer_count = 0
         self.is_capturing = False
 
 class TranscriptionRequest:
-    """Container for transcription request data."""
     def __init__(self, segment_id: int, audio_data: np.ndarray, initial_prompt: str = ""):
         self.segment_id = segment_id
         self.audio_data = audio_data
@@ -177,11 +168,15 @@ class SpeechDetector:
         except Exception as e:
             print(f"EOU unavailable: {e}")
         
-        # Transcriber with warm-up
+        # Transcriber
         self.transcriber = None
         if ENABLE_TRANSCRIPTION:
             self.transcriber = RealtimeTranscriber()
             self._warmup_transcriber()
+        
+        # LLM and TTS
+        self.llm_handler = LLMHandler()
+        self.tts_handler = TTSHandler()
         
         # State
         self.state = SpeechState.QUIET
@@ -192,17 +187,20 @@ class SpeechDetector:
         # Buffers
         self.segment_buffer = SpeechSegmentBuffer()
         self.is_listening = False
+        self.is_playing_response = False
         self.full_audio: List[np.ndarray] = []
         self.segment_count = 0
         
-        # Transcription queue system
+        # Transcription queue
         self.transcription_queue = asyncio.Queue(maxsize=MAX_TRANSCRIPTION_QUEUE_SIZE)
         self.transcription_started = False
         self.captured_segment = None
         self.dropped_segments = 0
+        
+        # Conversation history
+        self.conversation_history = []
     
     def _warmup_transcriber(self):
-        """Warm up Whisper model."""
         print("Warming up transcription model...")
         dummy_audio = np.random.randn(16000).astype(np.float32) * 0.001
         try:
@@ -235,7 +233,6 @@ class SpeechDetector:
         print(f"Total segments: {self.segment_count}\n")
     
     def process_chunk(self, audio_chunk: np.ndarray):
-        """Process audio chunk - called continuously regardless of listening state."""
         self.chunk_count += 1
         
         # Get VAD probability
@@ -243,11 +240,11 @@ class SpeechDetector:
         self.current_prob = prob
         self.smoothed_prob = ALPHA * prob + (1.0 - ALPHA) * self.smoothed_prob
         
-        # If not listening, just update VAD and return
-        if not self.is_listening:
+        # If not listening or playing response, just update VAD
+        if not self.is_listening or self.is_playing_response:
             return []
         
-        # Store for recording if enabled
+        # Store for recording
         if ENABLE_RECORDING:
             self.full_audio.append(audio_chunk.copy())
         
@@ -262,7 +259,6 @@ class SpeechDetector:
         return self._update_state()
     
     def _update_state(self):
-        """Update state machine and return events."""
         events = []
         
         if self.state == SpeechState.QUIET:
@@ -275,7 +271,6 @@ class SpeechDetector:
                 self.state = SpeechState.SPEAKING
                 events.append("speech_started")
             elif self.smoothed_prob < QUIET_THRESHOLD:
-                # False start
                 self.state = SpeechState.QUIET
                 self.segment_buffer.reset()
         
@@ -283,24 +278,19 @@ class SpeechDetector:
             if self.smoothed_prob < STOP_THRESHOLD:
                 self.state = SpeechState.STOPPING
                 events.append("speech_stopping")
-                # Mark that we should start transcription (only once)
                 if not self.transcription_started:
                     self.transcription_started = True
-                    # Capture the segment NOW and CLEAR it immediately
                     self.captured_segment = self.segment_buffer.get_segment()
                     events.append("start_transcription")
         
         elif self.state == SpeechState.STOPPING:
-            # Check if should finalize
             should_finalize = False
             
-            # Priority 1: EOU detection
             if self.eou and self.eou.has_sufficient_audio():
                 eou_result = self.eou.analyze()
                 if eou_result['utterance_ended'] and eou_result['confidence'] > 0.9:
                     should_finalize = True
             
-            # Priority 2: After safety margin, check if truly quiet
             if not should_finalize and self.segment_buffer.has_safety_margin():
                 if self.smoothed_prob < QUIET_THRESHOLD:
                     should_finalize = True
@@ -308,29 +298,24 @@ class SpeechDetector:
             if should_finalize:
                 self.state = SpeechState.QUIET
                 events.append("speech_ended")
+                events.append("process_response")  # Trigger LLM + TTS
                 
-                # Reset transcription flag for next segment
                 self.transcription_started = False
                 self.captured_segment = None
                 
                 if self.eou:
                     self.eou.reset()
             
-            # Resume speaking if VAD increases
             elif self.smoothed_prob > SPEAKING_THRESHOLD:
                 self.state = SpeechState.SPEAKING
                 events.append("speech_resumed")
                 self.segment_buffer.post_buffer_count = 0
-                # CRITICAL: If resuming, the old segment was already captured and queued
-                # Start fresh for the next segment
                 self.transcription_started = False
                 self.captured_segment = None
-                # Note: segment_buffer.active_segment already cleared by get_segment() call
         
         return events
     
     async def queue_transcription(self) -> bool:
-        """Queue a transcription request. Returns False if queue is full."""
         if not ENABLE_TRANSCRIPTION or not self.transcriber:
             return False
         
@@ -342,36 +327,30 @@ class SpeechDetector:
         
         self.segment_count += 1
         
-        # Create transcription request
         request = TranscriptionRequest(
             segment_id=self.segment_count,
             audio_data=segment_array,
             initial_prompt=""
         )
         
-        # Try to add to queue (non-blocking)
         try:
             self.transcription_queue.put_nowait(request)
-            print(f"Segment {request.segment_id}: Queued for transcription (length: {len(segment_array)/16000:.2f}s, queue size: {self.transcription_queue.qsize()})")
+            print(f"Segment {request.segment_id}: Queued for transcription (length: {len(segment_array)/16000:.2f}s)")
             return True
         except asyncio.QueueFull:
-            # Queue is full - drop this segment
             self.dropped_segments += 1
-            print(f"⚠️  Queue full! Dropped segment {request.segment_id} (total dropped: {self.dropped_segments})")
+            print(f"⚠️  Queue full! Dropped segment {request.segment_id}")
             return False
     
     async def process_transcription_queue(self, websocket: WebSocket):
-        """Consumer coroutine that processes transcription queue."""
         print("Transcription worker started")
         
         while True:
             try:
-                # Wait for next transcription request
                 request = await self.transcription_queue.get()
                 
-                print(f"Segment {request.segment_id}: Transcription started (queue size: {self.transcription_queue.qsize()})")
+                print(f"Segment {request.segment_id}: Transcription started")
                 
-                # Run transcription in executor to avoid blocking
                 loop = asyncio.get_event_loop()
                 transcript = await loop.run_in_executor(
                     None,
@@ -379,11 +358,16 @@ class SpeechDetector:
                     request.audio_data
                 )
                 
-                # Send result if valid
                 if transcript and transcript.strip():
-                    print(f"Segment {request.segment_id}: {transcript}")
+                    print(f"User said: {transcript}")
                     
-                    # Send to client
+                    # Add to conversation history
+                    self.conversation_history.append({
+                        "role": "user",
+                        "content": transcript
+                    })
+                    
+                    # Send transcript to client
                     response = {
                         "events": ["transcript"],
                         "transcript": transcript,
@@ -394,16 +378,95 @@ class SpeechDetector:
                 else:
                     print(f"Segment {request.segment_id}: Empty transcript, skipping")
                 
-                # Mark task as done
                 self.transcription_queue.task_done()
                 
             except Exception as e:
                 print(f"Transcription worker error: {e}")
-                # Continue processing even if one transcription fails
                 continue
     
+    async def process_llm_and_tts(self, websocket: WebSocket):
+        """Process the conversation through LLM and TTS when quiet event occurs."""
+        try:
+            # Block new speech input
+            self.is_playing_response = True
+            
+            # Check if we have any user input to respond to
+            user_messages = [msg for msg in self.conversation_history if msg['role'] == 'user']
+            if not user_messages:
+                print("No user input to respond to")
+                self.is_playing_response = False
+                return
+            
+            # Notify client that processing has started
+            await websocket.send_text(json.dumps({
+                "events": ["processing_started"],
+                "state": self.get_current_state()
+            }))
+            
+            # Get LLM response
+            print("Generating LLM response...")
+            loop = asyncio.get_event_loop()
+            
+            try:
+                llm_response = await loop.run_in_executor(
+                    None,
+                    self.llm_handler.generate_response,
+                    self.conversation_history
+                )
+            except Exception as llm_error:
+                print(f"LLM generation failed: {llm_error}")
+                llm_response = "I apologize, I'm having trouble processing that right now."
+            
+            if not llm_response or not llm_response.strip():
+                print("Empty LLM response, skipping")
+                self.is_playing_response = False
+                return
+            
+            print(f"Assistant: {llm_response}")
+            
+            # Add to conversation history
+            self.conversation_history.append({
+                "role": "assistant",
+                "content": llm_response
+            })
+            
+            # Generate TTS audio
+            print("Generating TTS audio...")
+            try:
+                audio_bytes = await loop.run_in_executor(
+                    None,
+                    self.tts_handler.generate_speech,
+                    llm_response
+                )
+            except Exception as tts_error:
+                print(f"TTS generation failed: {tts_error}")
+                audio_bytes = None
+            
+            if not audio_bytes:
+                print("Failed to generate TTS audio")
+                self.is_playing_response = False
+                return
+            
+            # Send audio to client
+            print(f"Sending audio response ({len(audio_bytes)} bytes)")
+            await websocket.send_bytes(audio_bytes)
+            
+            # Send completion event
+            await websocket.send_text(json.dumps({
+                "events": ["response_complete"],
+                "llm_response": llm_response,
+                "state": self.get_current_state()
+            }))
+            
+        except Exception as e:
+            print(f"Error in LLM/TTS processing: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            # Re-enable speech input
+            self.is_playing_response = False
+    
     def _get_vad_probability(self, chunk):
-        """Get VAD probability for chunk."""
         x = np.concatenate([self._vad_context, chunk.reshape(1, -1)], axis=1)
         out, self._vad_state = self.vad_session.run(
             None, 
@@ -413,7 +476,6 @@ class SpeechDetector:
         return float(out[0][0])
     
     def _save_wav(self, audio_array: np.ndarray, filename: str):
-        """Save audio to WAV file."""
         audio_int16 = (audio_array * 32767).astype(np.int16)
         with wave.open(filename, 'wb') as wav_file:
             wav_file.setnchannels(1)
@@ -422,27 +484,27 @@ class SpeechDetector:
             wav_file.writeframes(audio_int16.tobytes())
     
     def get_current_state(self) -> dict:
-        """Get current state for UI."""
         return {
             'state': self.state.value,
             'smoothed_prob': float(self.smoothed_prob),
             'segments_count': self.segment_count,
             'is_listening': self.is_listening,
+            'is_playing_response': self.is_playing_response,
         }
     
     def reset(self):
-        """Reset detector state."""
         self.state = SpeechState.QUIET
         self.smoothed_prob = 0.0
         self.current_prob = 0.0
         self.chunk_count = 0
         self.is_listening = False
+        self.is_playing_response = False
         self.full_audio = []
         self.segment_count = 0
         self.segment_buffer.reset()
         self.dropped_segments = 0
+        self.conversation_history = []
         
-        # Clear queue
         while not self.transcription_queue.empty():
             try:
                 self.transcription_queue.get_nowait()
@@ -467,7 +529,6 @@ async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
     detector = SpeechDetector()
     
-    # Start transcription worker in background
     transcription_worker = asyncio.create_task(
         detector.process_transcription_queue(websocket)
     )
@@ -476,26 +537,27 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             message = await websocket.receive()
             
-            # Binary audio data
             if "bytes" in message:
                 audio_array = np.frombuffer(message["bytes"], dtype=np.float32)
                 
                 if len(audio_array) == 512:
                     events = detector.process_chunk(audio_array)
                     
-                    # Queue transcription if needed
                     if "start_transcription" in events:
                         await detector.queue_transcription()
                     
-                    # Send state updates
+                    if "process_response" in events:
+                        await detector.process_llm_and_tts(websocket)
+                    
                     if events:
-                        response = {
-                            "events": [e for e in events if e != "start_transcription"],
-                            "state": detector.get_current_state()
-                        }
-                        await websocket.send_text(json.dumps(response))
+                        filtered_events = [e for e in events if e not in ["start_transcription", "process_response"]]
+                        if filtered_events:
+                            response = {
+                                "events": filtered_events,
+                                "state": detector.get_current_state()
+                            }
+                            await websocket.send_text(json.dumps(response))
             
-            # Text commands
             elif "text" in message:
                 data = json.loads(message["text"])
                 
@@ -510,6 +572,10 @@ async def websocket_endpoint(websocket: WebSocket):
                 elif data["type"] == "reset":
                     detector.reset()
                     await websocket.send_text(json.dumps({"reset": "ok"}))
+                
+                elif data["type"] == "audio_finished":
+                    # Client finished playing audio
+                    print("Client finished playing audio")
                 
     except WebSocketDisconnect:
         print("Client disconnected")
