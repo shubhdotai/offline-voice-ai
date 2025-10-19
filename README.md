@@ -275,3 +275,12 @@ MIT
 - MLX: [ml-explore/mlx](https://github.com/ml-explore/mlx)
 - Kokoro TTS: [hexgrad/Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M)
 - Smart Turn: [pipecat-ai](https://github.com/pipecat-ai/pipecat)
+
+
+## TODO
+- [ ] Testing (Unit, Integration, Load)
+- [ ] Fix the MLX Concurrency Issue (Architecture design - Gateway layer, Orchestrator, Services, Infra layer)
+- [ ] Error Handling
+- [ ] Configuration Management
+- [ ] Bug fixes and code qualiy
+- [ ] Multiple models (STT, TTS, LLM)
