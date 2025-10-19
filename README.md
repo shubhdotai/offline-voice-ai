@@ -77,7 +77,6 @@ QUIET_THRESHOLD = 0.05           # Return to quiet
 
 # Buffer Configuration
 SAFETY_CHUNKS_BEFORE = 4         # Pre-buffer: 128ms (4 × 32ms)
-SAFETY_CHUNKS_AFTER = 2          # Post-buffer: 64ms (2 × 32ms)
 
 # Queue Configuration
 MAX_TRANSCRIPTION_QUEUE_SIZE = 2 # Max pending transcriptions
