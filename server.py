@@ -192,9 +192,12 @@ class SpeechDetector:
         return events
     
     def get_state(self) -> dict:
+        vad_value = float(self.vad.smoothed_prob)
         return {
             'state': self.state.value,
-            'vad_prob': float(self.vad.smoothed_prob),
+            # Provide both legacy and UI-friendly keys
+            'vad': vad_value,
+            'vad_prob': vad_value,
             'segments': self.segment_count,
             'listening': self.is_listening,
             'responding': self.is_responding
