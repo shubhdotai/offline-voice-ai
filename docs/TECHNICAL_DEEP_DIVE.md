@@ -53,9 +53,9 @@ Comprehensive explanation of how every component works, connects, and enables re
 │  WebSocket Handler                                               │
 │       ↓                                                           │
 │  ┌────────────────────────────────────────┐                     │
-│  │  Voice Pipeline Orchestrator            │                     │
+│  │  VoicePipeline (async orchestrator)     │                     │
 │  │  ├─ Event dispatcher                    │                     │
-│  │  ├─ Task management (async)             │                     │
+│  │  ├─ Shared MLX lock + cancellation      │                     │
 │  │  └─ State synchronization               │                     │
 │  └────────────────────────────────────────┘                     │
 │       ↓                                                           │
@@ -674,15 +674,27 @@ Actions (synchronous):
     2. dom.audio.pause() + currentTime = 0
     3. botSpeaking = false
     4. Clear playback queue
+    5. sendJson({event: 'stop', target: 'playback'}) (server interrupt hint)
         ↓
 Send to server:
     - Pre-buffer (15 frames = 500ms context)
     - Burst frames (2-3 frames = 64-96ms)
         ↓
-Server receives audio → VAD processes → Response cancelled
+Server receives audio → VAD processes → `_interrupt_response()` sets cancel event → LLM/TTS tasks stop → Detector keeps listening
         ↓
 Continue as normal user speech
 ```
+
+### Server-side Cancellation
+
+When the UI flags an interruption, the server-side `VoicePipeline`:
+
+- Raises an `asyncio.Event` shared by the active LLM/TTS pipeline.  
+- Awaits `_cancel_response_task()`, ensuring any running response task is cancelled and awaited safely.  
+- Removes incomplete assistant turns before resuming listening.  
+- Emits a `"interrupt"` WebSocket event, so the browser instantly abandons queued audio.
+
+This guarantees that Whisper, the LLM, and Kokoro never generate output after the user barges in, while keeping the MLX runtime free for new transcription work.
 
 ---
 
@@ -737,66 +749,52 @@ Continue as normal user speech
 ### State Machine Code
 
 ```python
-def _update_state(self) -> List[PipelineEvent]:
-    events = []
-    
+def _update_state(self, vad_prob: float) -> List[PipelineEvent]:
+    events: List[PipelineEvent] = []
+    prev_state = self.state
+
     if self.state == SpeechState.QUIET:
-        if self.smoothed_prob >= START_THRESHOLD:
-            self._set_state(SpeechState.STARTING)
-            events.append(PipelineEvent.SPEECH_STARTING)
-            
-            # Check for interruption during bot response
-            if self.is_playing_response:
-                print("[interrupt] User interrupting bot")
-    
+        if vad_prob >= VAD_START_THRESHOLD:
+            self.state = SpeechState.STARTING
+            self.user_speaking = True
+            events.append(PipelineEvent.SPEECH_START)
+
     elif self.state == SpeechState.STARTING:
-        if self.smoothed_prob >= SPEAKING_THRESHOLD:
-            self._set_state(SpeechState.SPEAKING)
-            events.append(PipelineEvent.SPEECH_STARTED)
-        elif self.smoothed_prob < QUIET_THRESHOLD:
-            self._set_state(SpeechState.QUIET)
-            self.segment_buffer.reset()
-    
+        if vad_prob >= VAD_SPEAKING_THRESHOLD:
+            self.state = SpeechState.SPEAKING
+        elif vad_prob < VAD_QUIET_THRESHOLD:
+            self.state = SpeechState.QUIET
+            self.user_speaking = False
+
     elif self.state == SpeechState.SPEAKING:
-        if self.smoothed_prob < STOP_THRESHOLD:
-            self._set_state(SpeechState.STOPPING)
-            events.append(PipelineEvent.SPEECH_STOPPING)
-            
-            # Capture segment for transcription
-            if not self.transcription_started:
-                self.transcription_started = True
-                self.captured_segment = self.segment_buffer.get_segment()
-                events.append(PipelineEvent.START_TRANSCRIPTION)
-    
+        if vad_prob < VAD_STOP_THRESHOLD:
+            self.state = SpeechState.STOPPING
+            self.current_segment = self.buffer.get_segment()
+            if self.current_segment is not None:
+                events.append(PipelineEvent.TRANSCRIBE)
+
     elif self.state == SpeechState.STOPPING:
-        should_finalize = False
-        
-        # Check EoU detector
-        if self.eou and self.eou.has_sufficient_audio():
-            eou_result = self.eou.analyze()
-            if eou_result['utterance_ended'] and eou_result['confidence'] > 0.9:
-                should_finalize = True
-        
-        # Check safety margin
-        if not should_finalize and self.segment_buffer.has_safety_margin():
-            if self.smoothed_prob < QUIET_THRESHOLD:
-                should_finalize = True
-        
-        if should_finalize:
-            self._set_state(SpeechState.QUIET)
-            events.append(PipelineEvent.SPEECH_ENDED)
-            events.append(PipelineEvent.PROCESS_RESPONSE)
-            
-            self.transcription_started = False
+        vad_quiet = vad_prob < VAD_QUIET_THRESHOLD
+        eou_confirms = not self.eou
+        if self.eou and vad_quiet and self.eou.has_enough_audio():
+            result = self.eou.detect()
+            eou_confirms = result['ended'] and result['confidence'] > EOU_CONFIDENCE_THRESHOLD
+        if vad_quiet and eou_confirms:
+            self.state = SpeechState.QUIET
+            events.append(PipelineEvent.SPEECH_END)
+            if self.user_speaking:
+                events.append(PipelineEvent.RESPOND)
+                self.user_speaking = False
             if self.eou:
                 self.eou.reset()
-        
-        elif self.smoothed_prob > SPEAKING_THRESHOLD:
-            # User resumed speaking
-            self._set_state(SpeechState.SPEAKING)
-            events.append(PipelineEvent.SPEECH_RESUMED)
-            self.segment_buffer.post_buffer_count = 0
-    
+            self.current_segment = None
+        elif vad_prob > VAD_SPEAKING_THRESHOLD:
+            self.state = SpeechState.SPEAKING
+            self.current_segment = None
+
+    if prev_state != self.state:
+        print(f"[state] {prev_state.value} → {self.state.value} (vad: {vad_prob:.3f})")
+
     return events
 ```
 
@@ -812,24 +810,42 @@ def _update_state(self) -> List[PipelineEvent]:
 
 **Implementation**:
 ```python
-class SpeechSegmentBuffer:
-    def __init__(self, safety_before=4):
-        self.pre_buffer = []
-        self.safety_before = safety_before
+class AudioBuffer:
+    def __init__(self):
+        self.pre_buffer: List[np.ndarray] = []
+        self.active_segment: List[np.ndarray] = []
+        self.is_capturing = False
     
-    def add_chunk(self, chunk, state):
+    def add_chunk(self, chunk: np.ndarray, state: SpeechState):
+        chunk = chunk.copy()
+        
         if state == SpeechState.QUIET:
-            # Maintain rolling pre-buffer
-            self.pre_buffer.append(chunk.copy())
-            if len(self.pre_buffer) > self.safety_before:
+            self.pre_buffer.append(chunk)
+            if len(self.pre_buffer) > SAFETY_CHUNKS_BEFORE:
                 self.pre_buffer.pop(0)
         
         elif state == SpeechState.STARTING:
-            # Transfer pre-buffer to active segment
             if not self.is_capturing:
                 self.is_capturing = True
-                self.active_segment = [c.copy() for c in self.pre_buffer]
-            self.active_segment.append(chunk.copy())
+                self.active_segment = self.pre_buffer.copy()
+            self.active_segment.append(chunk)
+            self.pre_buffer.append(chunk)
+            if len(self.pre_buffer) > SAFETY_CHUNKS_BEFORE:
+                self.pre_buffer.pop(0)
+        
+        elif state == SpeechState.SPEAKING:
+            self.active_segment.append(chunk)
+        
+        elif state == SpeechState.STOPPING:
+            self.active_segment.append(chunk)
+    
+    def get_segment(self) -> Optional[np.ndarray]:
+        if not self.active_segment:
+            return None
+        segment = np.concatenate(self.active_segment)
+        self.active_segment = []
+        self.is_capturing = False
+        return segment
 ```
 
 **Timeline**:

@@ -20,6 +20,7 @@ Full-duplex voice assistant with real-time speech detection, transcription, LLM 
 - **Full-Duplex Barge-In**: Interrupt bot responses naturally
 - **Echo Cancellation**: Reference signal correlation (AudioWorklet-based)
 - **Async Processing**: Queue-based STT with parallel LLM/TTS streaming
+- **Instant Cancellation**: Shared cancel signal stops LLM/TTS the moment a user barges in
 - **Rolling Audio Buffer**: Captures pre-interruption context (~500ms)
 - **WebSocket Communication**: Real-time bidirectional audio/text streaming
 - **Responsive UI**: Live state visualization and conversation history
@@ -65,25 +66,33 @@ Open `http://localhost:8000` in your browser and click **"Start Listening"**.
 
 ## Configuration
 
-Edit thresholds in `server.py`:
+Edit core constants in `config.py`:
 
 ```python
-# VAD Configuration
-ALPHA = 0.2                      # Smoothing factor (0-1)
-START_THRESHOLD = 0.3            # Speech start detection
-SPEAKING_THRESHOLD = 0.5         # Confirmed speaking
-STOP_THRESHOLD = 0.3             # Speech stopping
-QUIET_THRESHOLD = 0.05           # Return to quiet
+# Audio / buffering
+SAMPLE_RATE = 16000
+CHUNK_SIZE = 512                 # 32ms per frame at 16 kHz
+SAFETY_CHUNKS_BEFORE = 4         # Pre-buffer: 128ms
 
-# Buffer Configuration
-SAFETY_CHUNKS_BEFORE = 4         # Pre-buffer: 128ms (4 × 32ms)
+# VAD thresholds (Silero probabilities)
+VAD_ALPHA = 0.1
+VAD_START_THRESHOLD = 0.3
+VAD_SPEAKING_THRESHOLD = 0.5
+VAD_STOP_THRESHOLD = 0.3
+VAD_QUIET_THRESHOLD = 0.05
 
 # Queue Configuration
-MAX_TRANSCRIPTION_QUEUE_SIZE = 2 # Max pending transcriptions
+MAX_TRANSCRIPTION_QUEUE_SIZE = 256  # Pending STT segments
+MIN_SEGMENT_DURATION = 0.3          # Seconds required for STT
 
 # Feature Flags
-ENABLE_RECORDING = False         # Save full audio to WAV
-ENABLE_TRANSCRIPTION = True      # Enable STT processing
+ENABLE_RECORDING = False
+ENABLE_TRANSCRIPTION = True
+
+# LLM / TTS
+LLM_MAX_TOKENS = 256
+LLM_MIN_TOKENS_FOR_TTS = 3
+TTS_SPEED = 1.0
 ```
 
 Edit interruption sensitivity in `index.html`:
