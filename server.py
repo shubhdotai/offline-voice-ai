@@ -465,6 +465,7 @@ class VoicePipeline:
             # CRITICAL: Acquire MLX lock for entire LLM generation
             # This prevents concurrent Whisper transcription during LLM use
             async with self.resources.mlx_lock:
+                # for sentence in self.resources.llm_handler.stream_response_batched(self.conversation):
                 for sentence in self.resources.llm_handler.stream_response(self.conversation):
                     if cancel_event.is_set() or not self.detector.is_responding:
                         print("[response] Interrupted")
