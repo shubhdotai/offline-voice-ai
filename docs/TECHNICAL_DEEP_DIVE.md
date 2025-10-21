@@ -2,6 +2,7 @@
 
 Fast snapshot of how the <1 s MLX voice agent stays responsive.
 
+## Click below for demo
 [![Watch the demo](https://img.youtube.com/vi/6IEK2fXB_ok/0.jpg)](https://www.youtube.com/watch?v=6IEK2fXB_ok)
 
 ## Pipeline

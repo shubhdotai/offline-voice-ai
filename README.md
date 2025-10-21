@@ -2,6 +2,7 @@
 
 Ultra-responsive, full-duplex voice assistant tuned for Apple Silicon + MLX. End-to-end round trip (speech → LLM → TTS) is consistently under **1 second**, even while handling barge-in.
 
+## Click below for demo
 [![Watch the demo](https://img.youtube.com/vi/6IEK2fXB_ok/0.jpg)](https://www.youtube.com/watch?v=6IEK2fXB_ok)
 
 ## Highlights
